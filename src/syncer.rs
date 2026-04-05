@@ -1,5 +1,9 @@
 use crate::backend::{EPOCH_CURSOR, SecretBackend};
+use crate::encryptor::{Encrypted, KeyEncryptor};
 use crate::secret_rotation::InMemorySecretGroup;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio_util::sync::CancellationToken;
@@ -14,22 +18,44 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const ROTATION_POLL_BUFFER: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Converts a DB-sourced nonce `Vec` into a fixed-size array.
+/// Returns `None` for both absent nonces and malformed ones (wrong length triggers
+/// a "missing nonce" error at decryption time, surfacing the invariant violation).
+fn to_nonce(v: Option<Vec<u8>>) -> Option<[u8; 12]> {
+    v.and_then(|b| b.try_into().ok())
+}
+
+fn payload_hash(enc: &Encrypted) -> u64 {
+    let mut h = DefaultHasher::new();
+    enc.ciphertext.hash(&mut h);
+    enc.nonce.hash(&mut h);
+    enc.key_version.hash(&mut h);
+    h.finish()
+}
+
+// ---------------------------------------------------------------------------
 // SecretSyncer
 // ---------------------------------------------------------------------------
 
-pub struct SecretSyncer<B: SecretBackend, const V: usize = 256, const S: usize = 32> {
+pub struct SecretSyncer<B: SecretBackend, E: KeyEncryptor + Clone, const V: usize = 256, const S: usize = 32> {
     group_id: Uuid,
     secret: Arc<InMemorySecretGroup<V, S>>,
     backend: B,
+    encryptor: E,
     rotation_interval: Duration,
     poll_interval: Duration,
+    seen_hashes: HashMap<u8, u64>,
 }
 
-impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
+impl<B: SecretBackend, E: KeyEncryptor + Clone, const V: usize, const S: usize> SecretSyncer<B, E, V, S> {
     pub fn new(
         group_id: Uuid,
         secret: Arc<InMemorySecretGroup<V, S>>,
         backend: B,
+        encryptor: E,
         rotation_interval: Duration,
         poll_interval: Option<Duration>,
     ) -> Self {
@@ -37,13 +63,15 @@ impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
             group_id,
             secret,
             backend,
+            encryptor,
             rotation_interval,
             poll_interval: poll_interval.unwrap_or(DEFAULT_POLL_INTERVAL),
+            seen_hashes: HashMap::new(),
         }
     }
 
     pub async fn initial_load(
-        &self,
+        &mut self,
         token: &CancellationToken,
     ) -> Result<(SystemTime, i64), B::Error> {
         let records = self.backend.load_all(self.group_id).await?;
@@ -61,15 +89,56 @@ impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
                 max_id = record.id;
             }
 
-            if let Ok(key) = <[u8; S]>::try_from(record.key_bytes) {
-                self.secret.store_key(record.version, key);
+            if (record.version as usize) >= V {
+                error!(
+                    group_id = %self.group_id,
+                    version = record.version,
+                    ring_size = V,
+                    "SecretSyncer: version exceeds ring buffer size, skipping"
+                );
+                continue;
+            }
+
+            let enc = Encrypted {
+                ciphertext: record.key_bytes,
+                nonce: to_nonce(record.nonce),
+                key_version: record.encryption_key_version,
+            };
+            let hash = payload_hash(&enc);
+
+            if self.seen_hashes.get(&record.version) == Some(&hash) {
+                // payload unchanged — key is already in the ring, skip decryption
                 if record.activated_at <= now {
                     if record.activated_at >= latest_active_at {
                         latest_active_at = record.activated_at;
                         latest_active_version = Some(record.version);
                     }
-                } else {
-                    self.schedule_promotion(record.version, record.activated_at, token.clone());
+                }
+                continue;
+            }
+
+            match self.encryptor.decrypt(&enc).await {
+                Ok(bytes) => {
+                    if let Ok(key) = <[u8; S]>::try_from(bytes) {
+                        self.secret.store_key(record.version, key);
+                        self.seen_hashes.insert(record.version, hash);
+                        if record.activated_at <= now {
+                            if record.activated_at >= latest_active_at {
+                                latest_active_at = record.activated_at;
+                                latest_active_version = Some(record.version);
+                            }
+                        } else {
+                            self.schedule_promotion(record.version, record.activated_at, token.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        group_id = %self.group_id,
+                        version = record.version,
+                        error = %e,
+                        "SecretSyncer: decryption failed during initial load"
+                    );
                 }
             }
         }
@@ -82,7 +151,7 @@ impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
         Ok((max_time, max_id))
     }
 
-    pub async fn run(self, token: CancellationToken, mut cursor: (SystemTime, i64)) {
+    pub async fn run(mut self, token: CancellationToken, mut cursor: (SystemTime, i64)) {
         loop {
             let now = SystemTime::now();
             let next_expected = cursor.0.checked_add(self.rotation_interval).unwrap_or(now);
@@ -107,13 +176,44 @@ impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
                                 if (record.activated_at, record.id) > cursor {
                                     cursor = (record.activated_at, record.id);
                                 }
-                                if let Ok(key) = <[u8; S]>::try_from(record.key_bytes) {
-                                    self.secret.store_key(record.version, key);
-                                    let now = SystemTime::now();
-                                    if record.activated_at <= now {
-                                        self.secret.promote(record.version);
-                                    } else {
-                                        self.schedule_promotion(record.version, record.activated_at, token.clone());
+                                if (record.version as usize) >= V {
+                                    error!(
+                                        group_id = %self.group_id,
+                                        version = record.version,
+                                        ring_size = V,
+                                        "SecretSyncer: version exceeds ring buffer size, skipping"
+                                    );
+                                    continue;
+                                }
+                                let enc = Encrypted {
+                                    ciphertext: record.key_bytes,
+                                    nonce: to_nonce(record.nonce),
+                                    key_version: record.encryption_key_version,
+                                };
+                                let hash = payload_hash(&enc);
+                                if self.seen_hashes.get(&record.version) == Some(&hash) {
+                                    continue;
+                                }
+                                match self.encryptor.decrypt(&enc).await {
+                                    Ok(bytes) => {
+                                        if let Ok(key) = <[u8; S]>::try_from(bytes) {
+                                            self.secret.store_key(record.version, key);
+                                            self.seen_hashes.insert(record.version, hash);
+                                            let now = SystemTime::now();
+                                            if record.activated_at <= now {
+                                                self.secret.promote(record.version);
+                                            } else {
+                                                self.schedule_promotion(record.version, record.activated_at, token.clone());
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            group_id = %self.group_id,
+                                            version = record.version,
+                                            error = %e,
+                                            "SecretSyncer: decryption failed during poll"
+                                        );
                                     }
                                 }
                             }
@@ -159,10 +259,17 @@ impl<B: SecretBackend, const V: usize, const S: usize> SecretSyncer<B, V, S> {
 mod tests {
     use super::*;
     use crate::backend::KeyRecord;
+    use crate::encryptor::Encrypted;
+    use crate::no_op_encryptor::NoOpEncryptor;
     use crate::secret_rotation::SecretGroup;
+    use anyhow::Result as AnyResult;
     use async_trait::async_trait;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    // -----------------------------------------------------------------------
+    // Shared test infrastructure
+    // -----------------------------------------------------------------------
 
     #[derive(Debug)]
     struct MockError;
@@ -173,17 +280,27 @@ mod tests {
     }
     impl std::error::Error for MockError {}
 
+    /// Cloneable mock backend. Clones share the same poll queue via `Arc`.
+    #[derive(Clone)]
     struct MockBackend {
         load_response: Vec<KeyRecord>,
-        poll_responses: Mutex<VecDeque<Vec<KeyRecord>>>,
+        poll_responses: Arc<Mutex<VecDeque<Result<Vec<KeyRecord>, MockError>>>>,
     }
 
     impl MockBackend {
         fn with_load(records: Vec<KeyRecord>) -> Self {
             Self {
                 load_response: records,
-                poll_responses: Mutex::new(VecDeque::new()),
+                poll_responses: Arc::new(Mutex::new(VecDeque::new())),
             }
+        }
+
+        fn push_poll(&self, records: Vec<KeyRecord>) {
+            self.poll_responses.lock().unwrap().push_back(Ok(records));
+        }
+
+        fn push_poll_err(&self) {
+            self.poll_responses.lock().unwrap().push_back(Err(MockError));
         }
     }
 
@@ -199,45 +316,293 @@ mod tests {
             _since_time: SystemTime,
             _since_id: i64,
         ) -> Result<Vec<KeyRecord>, MockError> {
-            Ok(self
-                .poll_responses
+            self.poll_responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_default())
+                .unwrap_or(Ok(vec![]))
         }
     }
+
+    /// Encryptor that counts how many times `decrypt` has been called.
+    #[derive(Clone)]
+    struct CountingEncryptor {
+        decrypt_calls: Arc<Mutex<usize>>,
+    }
+
+    impl CountingEncryptor {
+        fn new() -> Self {
+            Self { decrypt_calls: Arc::new(Mutex::new(0)) }
+        }
+        fn decrypt_calls(&self) -> usize {
+            *self.decrypt_calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl KeyEncryptor for CountingEncryptor {
+        async fn encrypt(&self, plaintext: &[u8]) -> AnyResult<Encrypted> {
+            Ok(Encrypted { ciphertext: plaintext.to_vec(), nonce: None, key_version: 0 })
+        }
+        async fn decrypt(&self, enc: &Encrypted) -> AnyResult<Vec<u8>> {
+            *self.decrypt_calls.lock().unwrap() += 1;
+            Ok(enc.ciphertext.clone())
+        }
+    }
+
+    fn rec(id: i64, version: u8, fill: u8, activated_at: SystemTime) -> KeyRecord {
+        KeyRecord {
+            id,
+            version,
+            key_bytes: vec![fill; 32],
+            nonce: None,
+            encryption_key_version: 0,
+            activated_at,
+        }
+    }
+
+    fn make_syncer<E: KeyEncryptor + Clone>(
+        backend: MockBackend,
+        group: Arc<InMemorySecretGroup<256, 32>>,
+        enc: E,
+    ) -> SecretSyncer<MockBackend, E, 256, 32> {
+        SecretSyncer::new(
+            Uuid::nil(),
+            group,
+            backend,
+            enc,
+            Duration::from_secs(3600),
+            Some(Duration::from_millis(10)),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // initial_load
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn initial_load_applies_all_keys_and_promotes_latest_active() {
         let now = SystemTime::now();
         let backend = MockBackend::with_load(vec![
-            KeyRecord {
-                id: 1,
-                version: 0,
-                key_bytes: vec![0xAA; 32],
-                activated_at: now - Duration::from_secs(600),
-            },
-            KeyRecord {
-                id: 2,
-                version: 1,
-                key_bytes: vec![0xBB; 32],
-                activated_at: now - Duration::from_secs(300),
-            },
+            rec(1, 0, 0xAA, now - Duration::from_secs(600)),
+            rec(2, 1, 0xBB, now - Duration::from_secs(300)),
         ]);
         let group = Arc::new(InMemorySecretGroup::<256, 32>::new(0, [0u8; 32]));
-        let syncer = SecretSyncer::new(
+        let mut syncer = make_syncer(backend, Arc::clone(&group), NoOpEncryptor);
+        syncer.initial_load(&CancellationToken::new()).await.unwrap();
+        let (v, _) = group.current();
+        assert_eq!(v, 1);
+    }
+
+    #[tokio::test]
+    async fn initial_load_empty_returns_epoch_cursor() {
+        let backend = MockBackend::with_load(vec![]);
+        let group = Arc::new(InMemorySecretGroup::<256, 32>::new(0, [0u8; 32]));
+        let mut syncer = make_syncer(backend, Arc::clone(&group), NoOpEncryptor);
+        let (t, id) = syncer.initial_load(&CancellationToken::new()).await.unwrap();
+        assert_eq!(t, EPOCH_CURSOR);
+        assert_eq!(id, 0);
+    }
+
+    #[tokio::test]
+    async fn initial_load_returns_max_cursor() {
+        let t0 = SystemTime::now() - Duration::from_secs(60);
+        let t1 = SystemTime::now();
+        let backend = MockBackend::with_load(vec![
+            rec(10, 0, 0xAA, t0),
+            rec(20, 1, 0xBB, t1), // highest (t1, id=20)
+        ]);
+        let group = Arc::new(InMemorySecretGroup::<256, 32>::new(0, [0u8; 32]));
+        let mut syncer = make_syncer(backend, Arc::clone(&group), NoOpEncryptor);
+        let (t, id) = syncer.initial_load(&CancellationToken::new()).await.unwrap();
+        assert_eq!(id, 20);
+        assert!(t.duration_since(t1).unwrap_or_default().as_millis() < 5);
+    }
+
+    #[tokio::test]
+    async fn initial_load_stores_future_key_but_does_not_promote_it() {
+        tokio::time::pause();
+        let future_at = SystemTime::now() + Duration::from_secs(30);
+        let backend = MockBackend::with_load(vec![rec(1, 1, 0xCC, future_at)]);
+        let group = Arc::new(InMemorySecretGroup::<256, 32>::new(0, [0xFFu8; 32]));
+        let mut syncer = make_syncer(backend, Arc::clone(&group), NoOpEncryptor);
+        syncer.initial_load(&CancellationToken::new()).await.unwrap();
+
+        // Key is stored in the ring but not promoted yet.
+        assert_eq!(group.resolve(1), Some([0xCC; 32]));
+        assert_eq!(group.current().0, 0, "current must still be the initial version");
+    }
+
+    #[tokio::test]
+    async fn initial_load_future_key_promoted_after_activation_time() {
+        tokio::time::pause();
+        let future_at = SystemTime::now() + Duration::from_secs(10);
+        let backend = MockBackend::with_load(vec![rec(1, 1, 0xCC, future_at)]);
+        let group = Arc::new(InMemorySecretGroup::<256, 32>::new(0, [0xFFu8; 32]));
+        let token = CancellationToken::new();
+        let mut syncer = make_syncer(backend, Arc::clone(&group), NoOpEncryptor);
+        syncer.initial_load(&token).await.unwrap();
+
+        // Yield first so the spawned promotion task can register its sleep
+        // with the mock clock before we advance it.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(group.current().0, 1, "key must be promoted after activation time elapses");
+    }
+
+    #[tokio::test]
+    async fn initial_load_skips_version_out_of_ring_range() {
+        let now = SystemTime::now() - Duration::from_secs(1);
+        // Ring size is 4; version 4 is out of range.
+        let backend = MockBackend::with_load(vec![
+            rec(1, 0, 0xAA, now),
+            rec(2, 4, 0xBB, now), // out of range — should be silently skipped
+        ]);
+        let group = Arc::new(InMemorySecretGroup::<4, 32>::new(0, [0u8; 32]));
+        let mut syncer: SecretSyncer<MockBackend, NoOpEncryptor, 4, 32> = SecretSyncer::new(
             Uuid::nil(),
             Arc::clone(&group),
             backend,
+            NoOpEncryptor,
             Duration::from_secs(3600),
             None,
         );
-        syncer
-            .initial_load(&CancellationToken::new())
+        syncer.initial_load(&CancellationToken::new()).await.unwrap();
+
+        assert_eq!(group.current().0, 0);
+        assert!(group.resolve(0).is_some());
+        // version 4 was skipped — only 4 slots (0-3), so slot 4 doesn't exist
+    }
+
+    #[tokio::test]
+    async fn initial_load_dedup_skips_decrypt_on_repeated_load() {
+        let now = SystemTime::now() - Duration::from_secs(60);
+        let backend = MockBackend::with_load(vec![rec(1, 0, 0xAA, now)]);
+        let group = Arc::new(InMemorySecretGroup::<256, 32>::new(0, [0u8; 32]));
+        let enc = CountingEncryptor::new();
+        let mut syncer = make_syncer(backend, Arc::clone(&group), enc.clone());
+
+        syncer.initial_load(&CancellationToken::new()).await.unwrap();
+        assert_eq!(enc.decrypt_calls(), 1);
+
+        // Second load with identical payload — dedup must suppress the decrypt call.
+        syncer.initial_load(&CancellationToken::new()).await.unwrap();
+        assert_eq!(enc.decrypt_calls(), 1, "dedup should skip decrypt for unchanged payload");
+    }
+
+    // -----------------------------------------------------------------------
+    // run
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_exits_on_cancellation() {
+        let backend = MockBackend::with_load(vec![]);
+        let group = Arc::new(InMemorySecretGroup::<256, 32>::new(0, [0u8; 32]));
+        let mut syncer = make_syncer(backend, Arc::clone(&group), NoOpEncryptor);
+        let cursor = syncer.initial_load(&CancellationToken::new()).await.unwrap();
+
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(syncer.run(token.clone(), cursor));
+        token.cancel();
+        tokio::time::timeout(Duration::from_millis(200), handle)
             .await
+            .expect("run must exit promptly after cancellation")
             .unwrap();
-        let (v, _) = group.current();
-        assert_eq!(v, 1);
+    }
+
+    #[tokio::test]
+    async fn run_applies_polled_keys_and_promotes() {
+        tokio::time::pause();
+        let backend = MockBackend::with_load(vec![]);
+        let poll_handle = backend.clone();
+        let group = Arc::new(InMemorySecretGroup::<256, 32>::new(0, [0u8; 32]));
+        let mut syncer = make_syncer(backend, Arc::clone(&group), NoOpEncryptor);
+        let cursor = syncer.initial_load(&CancellationToken::new()).await.unwrap();
+
+        let past = SystemTime::now() - Duration::from_secs(5);
+        poll_handle.push_poll(vec![rec(1, 1, 0xBB, past)]);
+
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(syncer.run(token.clone(), cursor));
+
+        // Yield so the run task registers its sleep before we advance.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(group.current().0, 1);
+        assert_eq!(group.resolve(1), Some([0xBB; 32]));
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_poll_error_retries_and_eventually_recovers() {
+        tokio::time::pause();
+        let backend = MockBackend::with_load(vec![]);
+        let poll_handle = backend.clone();
+        let group = Arc::new(InMemorySecretGroup::<256, 32>::new(0, [0u8; 32]));
+        let mut syncer = make_syncer(backend, Arc::clone(&group), NoOpEncryptor);
+        let cursor = syncer.initial_load(&CancellationToken::new()).await.unwrap();
+
+        // First poll errors; second poll succeeds with a new key.
+        let past = SystemTime::now() - Duration::from_secs(5);
+        poll_handle.push_poll_err();
+        poll_handle.push_poll(vec![rec(1, 1, 0xBB, past)]);
+
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(syncer.run(token.clone(), cursor));
+
+        // Step 1: let the task register its first sleep (10ms poll interval), then fire it.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(15)).await;
+        // Step 2: yield so the task runs poll_new (errors) and registers the 30s backoff timer.
+        tokio::task::yield_now().await;
+        // Step 3: advance past 30s error backoff.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        // Step 4: yield so the task wakes from backoff, loops, and registers a new 10ms poll timer.
+        tokio::task::yield_now().await;
+        // Step 5: advance past the second 10ms poll timer.
+        tokio::time::advance(Duration::from_millis(15)).await;
+        // Step 6: yield so the task runs the successful poll_new and applies the key.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(group.current().0, 1, "must recover and apply key after error back-off");
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_dedup_skips_repeated_poll_records() {
+        tokio::time::pause();
+        let backend = MockBackend::with_load(vec![]);
+        let poll_handle = backend.clone();
+        let group = Arc::new(InMemorySecretGroup::<256, 32>::new(0, [0u8; 32]));
+        let enc = CountingEncryptor::new();
+        let mut syncer = make_syncer(backend, Arc::clone(&group), enc.clone());
+        let cursor = syncer.initial_load(&CancellationToken::new()).await.unwrap();
+
+        let past = SystemTime::now() - Duration::from_secs(5);
+        // Push the same record twice — the second should be skipped by dedup.
+        poll_handle.push_poll(vec![rec(1, 1, 0xBB, past)]);
+        poll_handle.push_poll(vec![rec(1, 1, 0xBB, past)]);
+
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(syncer.run(token.clone(), cursor));
+
+        tokio::task::yield_now().await;
+        // Two poll intervals to trigger both polls.
+        tokio::time::advance(Duration::from_millis(25)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(enc.decrypt_calls(), 1, "second identical poll record must be deduped");
+
+        token.cancel();
+        handle.await.unwrap();
     }
 }

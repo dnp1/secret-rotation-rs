@@ -1,6 +1,7 @@
 //! PostgreSQL-backed `SecretBackend` implementation using SQLx.
 
 use crate::backend::{KeyRecord, SecretBackend};
+use crate::encryptor::Encrypted;
 use crate::pg_queries::*;
 use crate::rotator::SecretRotationBackend;
 use async_trait::async_trait;
@@ -24,6 +25,8 @@ struct KeyRow {
     id: i64,
     version: i16,
     key_bytes: Vec<u8>,
+    nonce: Option<Vec<u8>>,
+    encryption_key_version: i16,
     activated_at: SqlxTimestamp,
 }
 
@@ -33,6 +36,8 @@ impl From<KeyRow> for KeyRecord {
             id: r.id,
             version: r.version as u8,
             key_bytes: r.key_bytes,
+            nonce: r.nonce,
+            encryption_key_version: r.encryption_key_version as u8,
             activated_at: r.activated_at.to_jiff().into(),
         }
     }
@@ -105,7 +110,7 @@ impl SecretRotationBackend for SqlxPgSecretBackend {
         group_id: Uuid,
         expected_version: Option<u8>,
         new_version: u8,
-        key_bytes: &[u8],
+        encrypted: &Encrypted,
         activated_at: SystemTime,
     ) -> Result<bool, Self::Error> {
         let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
@@ -126,7 +131,9 @@ impl SecretRotationBackend for SqlxPgSecretBackend {
         sqlx::query(INSERT_KEY_QUERY)
             .bind(group_id)
             .bind(new_version as i16)
-            .bind(key_bytes)
+            .bind(&encrypted.ciphertext)
+            .bind(&encrypted.nonce)
+            .bind(encrypted.key_version as i16)
             .bind(activated_at_jiff.to_sqlx())
             .execute(&mut *tx)
             .await?;
@@ -139,6 +146,7 @@ impl SecretRotationBackend for SqlxPgSecretBackend {
 mod tests {
     use super::*;
     use crate::backend::SecretBackend;
+    use crate::encryptor::Encrypted;
     use crate::rotator::SecretRotationBackend;
     use std::time::{Duration, SystemTime};
     use test_containers_util::sqlx_pg::PostgresTestDb;
@@ -150,6 +158,10 @@ mod tests {
         let db = PostgresTestDb::create("secret-rotation-sqlx", &MIGRATIONS, None, None).await;
         let backend = SqlxPgSecretBackend::new(db.pool());
         (db, backend)
+    }
+
+    fn no_op_encrypted(bytes: &[u8]) -> Encrypted {
+        Encrypted { ciphertext: bytes.to_vec(), nonce: None, key_version: 0 }
     }
 
     async fn insert_key(backend: &SqlxPgSecretBackend, group_id: Uuid, version: i16, bytes: &[u8]) {
@@ -183,25 +195,15 @@ mod tests {
         let t1 = SystemTime::now() - Duration::from_secs(60);
         let t2 = SystemTime::now();
 
-        // Insert with explicit activated_at so ordering is deterministic.
-        backend
-            .try_insert_key(gid, None, 2, &[2u8; 32], t0)
-            .await
-            .unwrap();
-        backend
-            .try_insert_key(gid, Some(2), 0, &[0u8; 32], t1)
-            .await
-            .unwrap();
-        backend
-            .try_insert_key(gid, Some(0), 1, &[1u8; 32], t2)
-            .await
-            .unwrap();
+        backend.try_insert_key(gid, None, 2, &no_op_encrypted(&[2u8; 32]), t0).await.unwrap();
+        backend.try_insert_key(gid, Some(2), 0, &no_op_encrypted(&[0u8; 32]), t1).await.unwrap();
+        backend.try_insert_key(gid, Some(0), 1, &no_op_encrypted(&[1u8; 32]), t2).await.unwrap();
 
         let records = backend.load_all(gid).await.unwrap();
         assert_eq!(records.len(), 3);
-        assert_eq!(records[0].version, 2); // earliest activated_at
+        assert_eq!(records[0].version, 2);
         assert_eq!(records[1].version, 0);
-        assert_eq!(records[2].version, 1); // latest activated_at
+        assert_eq!(records[2].version, 1);
         assert_eq!(records[0].key_bytes, vec![2u8; 32]);
     }
 
@@ -210,10 +212,7 @@ mod tests {
         let (_db, backend) = make_backend().await;
         let gid = Uuid::new_v4();
         let t = SystemTime::now();
-        backend
-            .try_insert_key(gid, None, 5, &[5u8; 32], t)
-            .await
-            .unwrap();
+        backend.try_insert_key(gid, None, 5, &no_op_encrypted(&[5u8; 32]), t).await.unwrap();
 
         let inserted = backend.load_all(gid).await.unwrap();
         let id = inserted[0].id;
@@ -230,18 +229,9 @@ mod tests {
         let t1 = SystemTime::now() - Duration::from_secs(120);
         let t2 = SystemTime::now() - Duration::from_secs(60);
 
-        backend
-            .try_insert_key(gid, None, 3, &[3u8; 32], t0)
-            .await
-            .unwrap();
-        backend
-            .try_insert_key(gid, Some(3), 7, &[7u8; 32], t1)
-            .await
-            .unwrap();
-        backend
-            .try_insert_key(gid, Some(7), 5, &[5u8; 32], t2)
-            .await
-            .unwrap();
+        backend.try_insert_key(gid, None, 3, &no_op_encrypted(&[3u8; 32]), t0).await.unwrap();
+        backend.try_insert_key(gid, Some(3), 7, &no_op_encrypted(&[7u8; 32]), t1).await.unwrap();
+        backend.try_insert_key(gid, Some(7), 5, &no_op_encrypted(&[5u8; 32]), t2).await.unwrap();
 
         let all = backend.load_all(gid).await.unwrap();
         let id0 = all[0].id;
@@ -285,16 +275,12 @@ mod tests {
         let activated_at = SystemTime::now() + Duration::from_secs(120);
 
         let inserted = backend
-            .try_insert_key(gid, None, 0, &[0u8; 32], activated_at)
+            .try_insert_key(gid, None, 0, &no_op_encrypted(&[0u8; 32]), activated_at)
             .await
             .unwrap();
         assert!(inserted);
 
-        let info = backend
-            .latest_key_info(gid)
-            .await
-            .unwrap()
-            .expect("expected Some");
+        let info = backend.latest_key_info(gid).await.unwrap().expect("expected Some");
         assert_eq!(info.0, 0);
         assert!(abs_diff(info.1, activated_at).as_millis() < 5);
     }
@@ -308,7 +294,7 @@ mod tests {
         insert_key(&backend, gid, 0, &[0u8; 32]).await;
 
         let inserted = backend
-            .try_insert_key(gid, None, 1, &[1u8; 32], t)
+            .try_insert_key(gid, None, 1, &no_op_encrypted(&[1u8; 32]), t)
             .await
             .unwrap();
         assert!(!inserted, "must return false when version already changed");
@@ -325,16 +311,10 @@ mod tests {
         let t0 = SystemTime::now() + Duration::from_secs(60);
         let t1 = SystemTime::now() + Duration::from_secs(120);
 
-        let ok0 = backend
-            .try_insert_key(gid, None, 0, &[0u8; 32], t0)
-            .await
-            .unwrap();
+        let ok0 = backend.try_insert_key(gid, None, 0, &no_op_encrypted(&[0u8; 32]), t0).await.unwrap();
         assert!(ok0);
 
-        let ok1 = backend
-            .try_insert_key(gid, Some(0), 1, &[1u8; 32], t1)
-            .await
-            .unwrap();
+        let ok1 = backend.try_insert_key(gid, Some(0), 1, &no_op_encrypted(&[1u8; 32]), t1).await.unwrap();
         assert!(ok1);
 
         let records = backend.load_all(gid).await.unwrap();
@@ -349,23 +329,14 @@ mod tests {
         let gid = Uuid::new_v4();
         let t2 = SystemTime::now() + Duration::from_secs(120);
 
-        // Insert version 10 directly (default now()), then insert version 2 with a future timestamp.
-        // latest_key_info orders by activated_at DESC, so version 2 should be returned.
         insert_key(&backend, gid, 10, &[10u8; 32]).await;
         let ok = backend
-            .try_insert_key(gid, Some(10), 2, &[2u8; 32], t2)
+            .try_insert_key(gid, Some(10), 2, &no_op_encrypted(&[2u8; 32]), t2)
             .await
             .unwrap();
         assert!(ok);
 
-        let info = backend
-            .latest_key_info(gid)
-            .await
-            .unwrap()
-            .expect("expected Some");
-        assert_eq!(
-            info.0, 2,
-            "must return most recently activated, not highest version number"
-        );
+        let info = backend.latest_key_info(gid).await.unwrap().expect("expected Some");
+        assert_eq!(info.0, 2, "must return most recently activated, not highest version number");
     }
 }

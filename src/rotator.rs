@@ -1,3 +1,4 @@
+use crate::encryptor::{Encrypted, KeyEncryptor};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -33,7 +34,7 @@ pub trait SecretRotationBackend: Send + Sync + 'static {
         group_id: Uuid,
         expected_version: Option<u8>,
         new_version: u8,
-        key_bytes: &[u8],
+        encrypted: &Encrypted,
         activated_at: SystemTime,
     ) -> Result<bool, Self::Error>;
 }
@@ -42,25 +43,29 @@ pub trait SecretRotationBackend: Send + Sync + 'static {
 // KeyRotator
 // ---------------------------------------------------------------------------
 
-pub struct KeyRotator<B: SecretRotationBackend, const S: usize = 32> {
+pub struct KeyRotator<B: SecretRotationBackend, E: KeyEncryptor + Clone, const V: usize = 256, const S: usize = 32> {
     group_id: Uuid,
     backend: B,
+    encryptor: E,
     rotation_interval: Duration,
     propagation_delay: Duration,
     generate_key: Arc<dyn Fn() -> [u8; S] + Send + Sync + 'static>,
 }
 
-impl<B: SecretRotationBackend, const S: usize> KeyRotator<B, S> {
+impl<B: SecretRotationBackend, E: KeyEncryptor + Clone, const V: usize, const S: usize> KeyRotator<B, E, V, S> {
     pub fn new(
         group_id: Uuid,
         backend: B,
         rotation_interval: Duration,
         propagation_delay: Duration,
+        encryptor: E,
         generate_key: impl Fn() -> [u8; S] + Send + Sync + 'static,
     ) -> Self {
+        const { assert!(V <= 256, "ring buffer size V must be ≤ 256; versions are u8") };
         Self {
             group_id,
             backend,
+            encryptor,
             rotation_interval,
             propagation_delay,
             generate_key: Arc::new(generate_key),
@@ -95,9 +100,22 @@ impl<B: SecretRotationBackend, const S: usize> KeyRotator<B, S> {
             }
 
             let expected_version = pre_info.map(|(v, _)| v);
-            let new_version = expected_version.map(|v| v.wrapping_add(1)).unwrap_or(0);
+            let new_version = expected_version
+                .map(|v| ((v as usize + 1) % V) as u8)
+                .unwrap_or(0);
             let key_bytes = (self.generate_key)();
             let activated_at = SystemTime::now() + self.propagation_delay;
+
+            let encrypted = match self.encryptor.encrypt(&key_bytes).await {
+                Ok(enc) => enc,
+                Err(e) => {
+                    error!(group_id = %self.group_id, error = %e, "KeyRotator: encryption failed");
+                    if sleep_or_cancel(ERROR_RETRY_DELAY, &token).await {
+                        break;
+                    }
+                    continue;
+                }
+            };
 
             match self
                 .backend
@@ -105,7 +123,7 @@ impl<B: SecretRotationBackend, const S: usize> KeyRotator<B, S> {
                     self.group_id,
                     expected_version,
                     new_version,
-                    &key_bytes,
+                    &encrypted,
                     activated_at,
                 )
                 .await
@@ -143,6 +161,8 @@ async fn sleep_or_cancel(duration: Duration, token: &CancellationToken) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encryptor::Encrypted;
+    use crate::no_op_encryptor::NoOpEncryptor;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -158,7 +178,7 @@ mod tests {
     struct TryInsertCall {
         expected_version: Option<u8>,
         new_version: u8,
-        key_bytes: Vec<u8>,
+        ciphertext: Vec<u8>,
         activated_at: SystemTime,
     }
 
@@ -197,7 +217,7 @@ mod tests {
             _group_id: Uuid,
             expected_version: Option<u8>,
             new_version: u8,
-            key_bytes: &[u8],
+            encrypted: &Encrypted,
             activated_at: SystemTime,
         ) -> Result<bool, MockError> {
             let result = self
@@ -210,7 +230,7 @@ mod tests {
                 self.inserted.lock().unwrap().push(TryInsertCall {
                     expected_version,
                     new_version,
-                    key_bytes: key_bytes.to_vec(),
+                    ciphertext: encrypted.ciphertext.clone(),
                     activated_at,
                 });
             }
@@ -225,11 +245,12 @@ mod tests {
         backend.push_latest(None);
         backend.push_latest(Some((0, SystemTime::now())));
 
-        let rotator = KeyRotator::new(
+        let rotator: KeyRotator<_, _, 256> = KeyRotator::new(
             Uuid::new_v4(),
             backend,
             Duration::from_secs(3600),
             Duration::from_secs(120),
+            NoOpEncryptor,
             || [42u8; 32],
         );
         let token = CancellationToken::new();
@@ -242,6 +263,10 @@ mod tests {
 
         let calls = inserted.lock().unwrap();
         assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].expected_version, None);
         assert_eq!(calls[0].new_version, 0);
+        // NoOpEncryptor passes bytes through as-is
+        assert_eq!(calls[0].ciphertext, vec![42u8; 32]);
+        assert!(calls[0].activated_at > SystemTime::now() + Duration::from_secs(100));
     }
 }

@@ -13,8 +13,12 @@ pub struct KeyRecord {
     pub id: i64,
     /// Ring-buffer slot index (fits in `u8` for the default 256-slot ring).
     pub version: u8,
-    /// Raw key bytes. The consumer is responsible for validating the length.
+    /// Encrypted key bytes (ciphertext). Decryption is the caller's responsibility.
     pub key_bytes: Vec<u8>,
+    /// Nonce used during encryption, or `None` for KMS / no-op.
+    pub nonce: Option<Vec<u8>>,
+    /// Version of the key-encryption key used (0 = no-op/plaintext).
+    pub encryption_key_version: u8,
     /// When this key became (or will become) active.
     pub activated_at: SystemTime,
 }

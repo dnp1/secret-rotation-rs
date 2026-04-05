@@ -1,4 +1,5 @@
 use crate::backend::SecretBackend;
+use crate::encryptor::KeyEncryptor;
 use crate::rotator::{KeyRotator, SecretRotationBackend};
 use crate::secret_rotation::{InMemorySecretGroup, SecretGroup};
 use crate::syncer::SecretSyncer;
@@ -9,27 +10,31 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub struct SecretManager<B, const V: usize = 256, const S: usize = 32>
+pub struct SecretManager<B, E, const V: usize = 256, const S: usize = 32>
 where
     B: SecretBackend + SecretRotationBackend + Clone,
+    E: KeyEncryptor + Clone,
 {
     group_id: Uuid,
     group: Arc<InMemorySecretGroup<V, S>>,
     backend: B,
+    encryptor: E,
     rotation_interval: Duration,
     propagation_delay: Duration,
     poll_interval: Option<Duration>,
     generate_key: Arc<dyn Fn() -> [u8; S] + Send + Sync + 'static>,
 }
 
-impl<B, const V: usize, const S: usize> SecretManager<B, V, S>
+impl<B, E, const V: usize, const S: usize> SecretManager<B, E, V, S>
 where
     B: SecretBackend + SecretRotationBackend + Clone,
+    E: KeyEncryptor + Clone,
 {
     pub fn new(
         group_id: Uuid,
         group: Arc<InMemorySecretGroup<V, S>>,
         backend: B,
+        encryptor: E,
         rotation_interval: Duration,
         propagation_delay: Duration,
         poll_interval: Option<Duration>,
@@ -40,6 +45,7 @@ where
             group_id,
             group,
             backend,
+            encryptor,
             rotation_interval,
             propagation_delay,
             poll_interval,
@@ -50,21 +56,23 @@ where
     pub async fn start(self, token: CancellationToken) -> Result<(), <B as SecretBackend>::Error> {
         let generate_key = Arc::clone(&self.generate_key);
 
-        let syncer = SecretSyncer::new(
+        let mut syncer = SecretSyncer::new(
             self.group_id,
             Arc::clone(&self.group),
             self.backend.clone(),
+            self.encryptor.clone(),
             self.rotation_interval,
             self.poll_interval,
         );
 
         let cursor = syncer.initial_load(&token).await?;
 
-        let rotator = KeyRotator::new(
+        let rotator: KeyRotator<B, E, V, S> = KeyRotator::new(
             self.group_id,
             self.backend,
             self.rotation_interval,
             self.propagation_delay,
+            self.encryptor,
             move || (generate_key)(),
         );
 
@@ -75,9 +83,10 @@ where
     }
 }
 
-impl<B, const V: usize, const S: usize> SecretGroup<V, S> for SecretManager<B, V, S>
+impl<B, E, const V: usize, const S: usize> SecretGroup<V, S> for SecretManager<B, E, V, S>
 where
     B: SecretBackend + SecretRotationBackend + Clone,
+    E: KeyEncryptor + Clone,
 {
     fn current(&self) -> (u8, [u8; S]) {
         self.group.current()
@@ -92,6 +101,8 @@ where
 mod tests {
     use super::*;
     use crate::backend::KeyRecord;
+    use crate::encryptor::Encrypted;
+    use crate::no_op_encryptor::NoOpEncryptor;
     use crate::rotator::SecretRotationBackend;
     use async_trait::async_trait;
     use std::collections::VecDeque;
@@ -154,7 +165,7 @@ mod tests {
             _group_id: Uuid,
             _expected_version: Option<u8>,
             _new_version: u8,
-            _key_bytes: &[u8],
+            _encrypted: &Encrypted,
             _activated_at: SystemTime,
         ) -> Result<bool, MockError> {
             Ok(false)
@@ -168,6 +179,8 @@ mod tests {
                 id: 1,
                 version: 0,
                 key_bytes: vec![0xAA; 32],
+                nonce: None,
+                encryption_key_version: 0,
                 activated_at: SystemTime::now() - Duration::from_secs(300),
             }],
             poll_responses: Arc::new(Mutex::new(VecDeque::new())),
@@ -178,6 +191,7 @@ mod tests {
             Uuid::nil(),
             Arc::clone(&group),
             backend,
+            NoOpEncryptor,
             Duration::from_secs(3600),
             Duration::from_secs(10),
             None,
@@ -203,13 +217,13 @@ mod tests {
             Uuid::nil(),
             group,
             backend,
+            NoOpEncryptor,
             Duration::from_secs(3600),
             Duration::from_secs(10),
             None,
             Some(|| [0u8; 32]),
         );
 
-        // Treat it as a SecretGroup trait object
         let sg: &dyn SecretGroup<256, 32> = &manager;
         let (v, k) = sg.current();
         assert_eq!(v, 42);
