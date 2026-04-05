@@ -5,6 +5,20 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use rand::{Rng, rng};
 
+/// [`KeyEncryptor`] that encrypts key material locally using AES-256-GCM-SIV.
+///
+/// A random 12-byte nonce is generated for every [`encrypt`](KeyEncryptor::encrypt) call and
+/// stored in [`Encrypted::nonce`].  This is required for [`decrypt`](KeyEncryptor::decrypt) —
+/// ciphertexts produced by other encryptors (e.g. KMS) that carry `nonce: None` will fail.
+///
+/// `LocalEncryptor` is a good fit when you want at-rest encryption without a network round-trip
+/// and your key-encryption key is already available locally (e.g. loaded from a secrets manager
+/// at startup or injected via an environment variable).
+///
+/// # Key versioning
+///
+/// `version` is stored in [`Encrypted::key_version`].  When you rotate the key-encryption key,
+/// bump `version` and keep the old `LocalEncryptor` around for decryption of existing records.
 #[derive(Clone, Copy)]
 pub struct LocalEncryptor {
     key: [u8; 32],
@@ -12,6 +26,10 @@ pub struct LocalEncryptor {
 }
 
 impl LocalEncryptor {
+    /// Create a new `LocalEncryptor`.
+    ///
+    /// - `key` — 32-byte key-encryption key (AES-256)
+    /// - `version` — stored in [`Encrypted::key_version`]; increment when you rotate the KEK
     pub fn new(key: &[u8; 32], version: u8) -> Self {
         Self { key: *key, version }
     }

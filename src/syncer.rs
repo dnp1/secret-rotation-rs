@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
-use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -40,8 +39,65 @@ fn payload_hash(enc: &Encrypted) -> u64 {
 // SecretSyncer
 // ---------------------------------------------------------------------------
 
+/// Background task that keeps an [`InMemorySecretGroup`] up-to-date by polling storage.
+///
+/// `SecretSyncer` is the **read side** of the key-management system.  It:
+///
+/// 1. **Initial load** — calls [`SecretBackend::load_all`] once at startup to hydrate the
+///    ring buffer and promote the most-recently-activated key as `current`.
+/// 2. **Poll loop** — periodically calls [`SecretBackend::poll_new`] to pick up keys added
+///    after the cursor.  Keys with `activated_at` in the future are stored in the ring but
+///    only promoted to `current` once their activation time arrives (via a spawned timer task).
+///
+/// A hash-based dedup cache prevents redundant [`KeyEncryptor::decrypt`] calls when the same
+/// ciphertext is seen again (e.g. after a service restart or a backend re-delivery).
+///
+/// The poll interval is adaptive: if a rotation is expected soon (based on `rotation_interval`),
+/// the syncer wakes earlier so it picks up the new key promptly; otherwise it sleeps for the
+/// configured `poll_interval`.
+///
+/// # Type parameters
+///
+/// - `B` — backend that implements [`SecretBackend`]
+/// - `E` — encryptor that implements [`KeyEncryptor`]
+/// - `V` — ring buffer size (must match the [`InMemorySecretGroup`] passed in, default 256)
+/// - `S` — key size in bytes (default 32)
+///
+/// # Standalone use
+///
+/// Use `SecretSyncer` directly when your instances should only **read** keys, not rotate them:
+///
+/// ```rust,no_run
+/// # use secret_manager::*;
+/// # use async_trait::async_trait;
+/// # use std::{sync::Arc, time::{Duration, SystemTime}};
+/// # use tokio_util::sync::CancellationToken;
+/// # #[derive(Clone)]
+/// # struct MyBackend;
+/// # #[async_trait]
+/// # impl SecretBackend for MyBackend {
+/// #     type Error = std::convert::Infallible;
+/// #     async fn load_all(&self, _: &str) -> Result<Vec<KeyRecord>, Self::Error> { Ok(vec![]) }
+/// #     async fn poll_new(&self, _: &str, _: SystemTime, _: i64) -> Result<Vec<KeyRecord>, Self::Error> { Ok(vec![]) }
+/// # }
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// # let (backend, encryptor) = (MyBackend, NoOpEncryptor);
+/// let group = Arc::new(InMemorySecretGroup::<256, 32>::new(0, [0u8; 32]));
+/// let mut syncer: SecretSyncer<_, _, 256, 32> = SecretSyncer::new(
+///     "session-tokens",
+///     Arc::clone(&group),
+///     backend,
+///     encryptor,
+///     Duration::from_secs(3600),
+///     None,
+/// );
+/// let token = CancellationToken::new();
+/// let cursor = syncer.initial_load(&token).await?;
+/// tokio::spawn(syncer.run(token, cursor));
+/// # Ok(()) }
+/// ```
 pub struct SecretSyncer<B: SecretBackend, E: KeyEncryptor + Clone, const V: usize = 256, const S: usize = 32> {
-    group_id: Uuid,
+    group_id: String,
     secret: Arc<InMemorySecretGroup<V, S>>,
     backend: B,
     encryptor: E,
@@ -51,8 +107,19 @@ pub struct SecretSyncer<B: SecretBackend, E: KeyEncryptor + Clone, const V: usiz
 }
 
 impl<B: SecretBackend, E: KeyEncryptor + Clone, const V: usize, const S: usize> SecretSyncer<B, E, V, S> {
+    /// Create a new `SecretSyncer`.
+    ///
+    /// # Arguments
+    ///
+    /// - `group_id` — identifies the logical key group in storage
+    /// - `secret` — the in-memory ring buffer to keep populated
+    /// - `backend` — implements [`SecretBackend`]
+    /// - `encryptor` — used to decrypt ciphertext from storage before placing keys in the ring
+    /// - `rotation_interval` — expected time between rotations; used to compute a smart early
+    ///   wake-up before the next key is due, reducing promotion latency
+    /// - `poll_interval` — base polling cadence; `None` uses the 5-second default
     pub fn new(
-        group_id: Uuid,
+        group_id: impl Into<String>,
         secret: Arc<InMemorySecretGroup<V, S>>,
         backend: B,
         encryptor: E,
@@ -60,7 +127,7 @@ impl<B: SecretBackend, E: KeyEncryptor + Clone, const V: usize, const S: usize> 
         poll_interval: Option<Duration>,
     ) -> Self {
         Self {
-            group_id,
+            group_id: group_id.into(),
             secret,
             backend,
             encryptor,
@@ -70,11 +137,23 @@ impl<B: SecretBackend, E: KeyEncryptor + Clone, const V: usize, const S: usize> 
         }
     }
 
+    /// Load all existing keys from storage and hydrate the ring buffer.
+    ///
+    /// Must be called once before [`run`](Self::run).  Returns a cursor
+    /// `(max_activated_at, max_id)` that marks the newest record seen; pass this directly to
+    /// `run` so the poll loop starts from where the initial load left off.
+    ///
+    /// Keys already present in the ring are not re-decrypted (hash dedup).  Keys with
+    /// `activated_at` in the future are stored but not yet promoted; a timer task is spawned
+    /// for each to promote them at the right moment.
+    ///
+    /// The `token` parameter is threaded through only for future cancellability of long-running
+    /// initial loads; it is not yet acted upon inside the method body.
     pub async fn initial_load(
         &mut self,
         token: &CancellationToken,
     ) -> Result<(SystemTime, i64), B::Error> {
-        let records = self.backend.load_all(self.group_id).await?;
+        let records = self.backend.load_all(&self.group_id).await?;
         let count = records.len();
         let mut max_time = EPOCH_CURSOR;
         let mut max_id = 0i64;
@@ -151,6 +230,12 @@ impl<B: SecretBackend, E: KeyEncryptor + Clone, const V: usize, const S: usize> 
         Ok((max_time, max_id))
     }
 
+    /// Run the poll loop until `token` is cancelled.
+    ///
+    /// Consumes `self`; pass to [`tokio::spawn`] after calling [`initial_load`](Self::initial_load).
+    ///
+    /// On backend errors the syncer backs off for 30 seconds before retrying.  Decryption
+    /// errors for individual records are logged and skipped; the loop continues.
     pub async fn run(mut self, token: CancellationToken, mut cursor: (SystemTime, i64)) {
         loop {
             let now = SystemTime::now();
@@ -170,7 +255,7 @@ impl<B: SecretBackend, E: KeyEncryptor + Clone, const V: usize, const S: usize> 
                     break;
                 }
                 _ = tokio::time::sleep(sleep_dur) => {
-                    match self.backend.poll_new(self.group_id, cursor.0, cursor.1).await {
+                    match self.backend.poll_new(&self.group_id, cursor.0, cursor.1).await {
                         Ok(records) => {
                             for record in records {
                                 if (record.activated_at, record.id) > cursor {
@@ -307,12 +392,12 @@ mod tests {
     #[async_trait]
     impl SecretBackend for MockBackend {
         type Error = MockError;
-        async fn load_all(&self, _group_id: Uuid) -> Result<Vec<KeyRecord>, MockError> {
+        async fn load_all(&self, _group_id: &str) -> Result<Vec<KeyRecord>, MockError> {
             Ok(self.load_response.clone())
         }
         async fn poll_new(
             &self,
-            _group_id: Uuid,
+            _group_id: &str,
             _since_time: SystemTime,
             _since_id: i64,
         ) -> Result<Vec<KeyRecord>, MockError> {
@@ -367,7 +452,7 @@ mod tests {
         enc: E,
     ) -> SecretSyncer<MockBackend, E, 256, 32> {
         SecretSyncer::new(
-            Uuid::nil(),
+            "test-syncer",
             group,
             backend,
             enc,
@@ -462,7 +547,7 @@ mod tests {
         ]);
         let group = Arc::new(InMemorySecretGroup::<4, 32>::new(0, [0u8; 32]));
         let mut syncer: SecretSyncer<MockBackend, NoOpEncryptor, 4, 32> = SecretSyncer::new(
-            Uuid::nil(),
+            "test-syncer",
             Arc::clone(&group),
             backend,
             NoOpEncryptor,

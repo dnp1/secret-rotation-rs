@@ -11,31 +11,32 @@ tokio-util = { version = "0.7.18", features = ["rt"] }
 async-trait = "0.1.89"
 jiff = { version = "0.2.1", features = ["serde"] }
 tracing = "0.1.44"
-uuid = { version = "1.21.0", features = ["serde", "v4"] }
 parking_lot = { version = "0.12.5", optional = true }
 arc-swap = { version = "1.7.1", optional = true }
 
 # Optional PostgreSQL Backends
-diesel = { version = "2.2.0", optional = true, features = ["postgres", "uuid"] }
+diesel = { version = "2.2.0", optional = true, features = ["postgres"] }
 diesel-async = { version = "0.8.0", optional = true, features = ["postgres", "bb8"] }
-sqlx = { version = "0.8.3", optional = true, features = ["postgres", "runtime-tokio-rustls", "uuid", "migrate"] }
+sqlx = { version = "0.8.3", optional = true, features = ["postgres", "runtime-tokio-rustls", "migrate"] }
 jiff-diesel = { version = "0.1.3", optional = true, features = ["postgres"] }
 jiff-sqlx = { version = "0.1.1", optional = true, features = ["postgres"] }
 rand = "0.10.0"
 aes-gcm-siv = "0.12.0-rc.3"
 anyhow = "1.0.102"
-aws-sdk-kms = "1.104.0"
+aws-sdk-kms = { version = "1.104.0", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.50.0", features = ["full", "test-util"] }
 test-containers-util = { version = "0.1.4", features = ["pg-diesel", "pg-sqlx", "moto"] }
 diesel_migrations = "2"
-secret-manager = { path = ".", features = ["pg-diesel-async", 'pg-sqlx'] }
+uuid = { version = "1", features = ["v4"] }
+secret-manager = { path = ".", features = ["pg-diesel-async", "pg-sqlx", "aws-kms"] }
 
 [features]
 default = []
 parking-lot = ["dep:parking_lot"]
 arc-swap = ["dep:arc-swap"]
+aws-kms = ["dep:aws-sdk-kms"]
 pg-diesel-async = [
     "dep:diesel",
     "dep:diesel-async",

@@ -4,6 +4,20 @@ use aws_sdk_kms::primitives::Blob;
 use crate::encryptor::{Encrypted, KeyEncryptor};
 use anyhow::Result;
 
+/// [`KeyEncryptor`] backed by AWS Key Management Service (KMS).
+///
+/// Each [`encrypt`](KeyEncryptor::encrypt) call invokes `kms:Encrypt` on the configured CMK.
+/// KMS manages its own IV internally, so [`Encrypted::nonce`] is always `None` for ciphertexts
+/// produced by this encryptor.
+///
+/// [`decrypt`](KeyEncryptor::decrypt) invokes `kms:Decrypt`; the `key_id` is embedded in the
+/// KMS ciphertext blob and does not need to be supplied again.
+///
+/// # Key versioning
+///
+/// `version` is a caller-controlled label stored in [`Encrypted::key_version`].  Increment it
+/// whenever you rotate the KMS CMK so that syncers can tell which CMK to use for a given
+/// ciphertext at decryption time (if you have multiple encryptors in rotation).
 #[derive(Clone)]
 pub struct KmsEncryptor {
     client: KmsClient,
@@ -12,6 +26,11 @@ pub struct KmsEncryptor {
 }
 
 impl KmsEncryptor {
+    /// Create a new `KmsEncryptor`.
+    ///
+    /// - `client` — pre-configured [`KmsClient`]; region and credentials come from the SDK config
+    /// - `key_id` — ARN, alias, or key ID of the KMS symmetric CMK to use
+    /// - `version` — stored in [`Encrypted::key_version`]; use 0 if you have a single CMK
     pub fn new(client: KmsClient, key_id: impl Into<String>, version: u8) -> Self {
         Self { client, key_id: key_id.into(), version }
     }

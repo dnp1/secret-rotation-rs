@@ -1,7 +1,7 @@
 CREATE TABLE IF NOT EXISTS secret_keys
 (
     id                     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    key_group              UUID        NOT NULL,
+    key_group              VARCHAR(32) NOT NULL,
     version                SMALLINT    NOT NULL,
     key_bytes              BYTEA       NOT NULL,
     nonce                  BYTEA,
