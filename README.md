@@ -4,7 +4,16 @@
 [![docs.rs](https://docs.rs/secret-manager/badge.svg)](https://docs.rs/secret-manager)
 [![codecov](https://codecov.io/gh/dnp1/secret-manager-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/dnp1/secret-manager-rs)
 
-Distributed secret-key rotation and in-process caching for Rust services.
+This library implements distributed secret key rotation and in-process caching for Rust services.
+
+It is particularly useful for rotating secrets used in JWT, PASETO, and ALTCHA (proof-of-work), but it is generic enough to be used with any type of secret.
+
+It is designed to run alongside your main application, although the rotator itself can run anywhere (for example, in a dedicated AWS Lambda).
+
+For high-throughput systems, it is often not worth waiting for the network latency of cloud key management services or paying their inherent costs.
+
+Using this crate, you can rotate secrets aggressively with minimal cost and performance overhead.
+
 
 ## Overview
 
