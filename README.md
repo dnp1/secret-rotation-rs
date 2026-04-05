@@ -34,6 +34,10 @@ Available features:
 | `pg-sqlx` | PostgreSQL backend using SQLx |
 | `pg-diesel-async` | PostgreSQL backend using Diesel (async) |
 | `aws-kms` | AWS KMS encryptor |
+| `arc-swap` | Use `arc-swap::ArcSwap` for the ring buffer — wait-free reads, best under read-heavy workloads |
+| `parking-lot` | Use `parking_lot::RwLock` instead of `std::sync::RwLock` — faster lock, no poison handling; ignored when `arc-swap` is also enabled |
+
+By default `InMemorySecretGroup` uses `std::sync::RwLock`. Enable `arc-swap` for the lowest read latency (reads never block), or `parking-lot` for a lighter-weight lock without the overhead of poison checking.
 
 See the [crate documentation](https://docs.rs/secret-manager) for full usage examples covering `SecretManager`, `KeyRotator`, and `SecretSyncer`.
 
