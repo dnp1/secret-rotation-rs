@@ -42,12 +42,12 @@ jobs:
       - name: Run tests with coverage
         env:
           TESTCONTAINERS_RYUK_DISABLED: "true"
-        run: cargo llvm-cov --all-features --codecov --output-path codecov.json
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
-          files: codecov.json
+          files: lcov.info
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 
